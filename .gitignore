@@ -1,0 +1,27 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Streamlit
+.streamlit/
+
+# Tijdelijke bestanden
+*.tmp
+*.log
+
+# OS-bestanden
+.DS_Store
+Thumbs.db
+
+# Audio/trainingsdata niet uploaden
+data/
+
+# Analysehistorie niet uploaden
+history/analyse_history.csv
