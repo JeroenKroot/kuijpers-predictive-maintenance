@@ -1,29 +1,17 @@
 from pathlib import Path
 import joblib
+import numpy as np
 import pandas as pd
 
-from src.feature_extraction import extract_features_from_file
+from src.feature_extraction import extract_segment_features_from_file
 
 
 MODEL_PATH = Path("models/model.pkl")
 
-# Gevoeligere grens voor predictive maintenance.
-# Bij 0.05 wordt een bestand eerder als afwijkend gezien dan bij 0.50.
-# Deze grens sluit aan bij:
-# - 0 t/m 5% afwijkend = normale situatie
-# - >5% afwijkend = niet meer volledig normaal
-ABNORMAL_THRESHOLD = 0.05
-
 
 def load_model_package(model_path: Path = MODEL_PATH) -> dict:
     """
-    Laadt het opgeslagen modelpakket.
-
-    Het pakket bevat:
-    - model
-    - feature_columns
-    - metrics
-    - model_version
+    Laadt het modelpakket met meerdere profielmodellen.
     """
 
     if not model_path.exists():
@@ -33,171 +21,350 @@ def load_model_package(model_path: Path = MODEL_PATH) -> dict:
 
     model_package = joblib.load(model_path)
 
-    required_keys = ["model", "feature_columns", "model_version"]
+    required_keys = [
+        "profile_models",
+        "feature_columns",
+        "model_version"
+    ]
 
     for key in required_keys:
         if key not in model_package:
-            raise ValueError(f"Het modelbestand mist verplichte informatie: {key}")
+            raise ValueError(
+                f"Het modelbestand mist verplichte informatie: {key}. "
+                "Train het profielspecifieke anomaly detection model opnieuw."
+            )
 
     return model_package
 
 
-def determine_status(anomaly_score: float) -> dict:
+def calculate_normality_score(raw_score: float, calibration_scores: np.ndarray) -> float:
     """
-    Vertaalt de anomaly score naar een duidelijke status.
-
-    Nieuwe grenswaarden:
-    - 0 t/m 5% afwijkend = normale situatie
-    - >5 t/m 20% afwijkend = onderzoek nodig
-    - >20% afwijkend = defect / niet normale situatie
-
-    Dit komt overeen met:
-    - 100 tot 95% normaal = normale situatie
-    - 95 tot 80% normaal = onderzoek nodig
-    - onder 80% normaal = defect / niet normaal
+    Zet de ruwe Isolation Forest-score om naar een normaliteits-score van 0 tot 100.
     """
 
-    if anomaly_score <= 5:
+    calibration_scores = np.asarray(calibration_scores)
+
+    if len(calibration_scores) == 0:
+        return 0.0
+
+    sorted_scores = np.sort(calibration_scores)
+
+    percentile_position = np.searchsorted(
+        sorted_scores,
+        raw_score,
+        side="right"
+    ) / len(sorted_scores)
+
+    normality_score = percentile_position * 100
+
+    return float(np.clip(normality_score, 0, 100))
+
+
+def determine_status(
+    normality_score: float,
+    attention_threshold: int,
+    defect_threshold: int
+) -> dict:
+    """
+    Bepaalt status op basis van de thresholds van het gekozen profielmodel.
+    """
+
+    if normality_score >= attention_threshold:
         return {
             "status": "Normale situatie",
             "status_level": "green",
-            "advice": "Geen directe actie nodig. Het geluidsfragment lijkt sterk op een normale situatie."
+            "advice": "Geen directe actie nodig. Het geluidsfragment lijkt voldoende op het normale geluidsprofiel."
         }
 
-    if anomaly_score <= 20:
+    if normality_score >= defect_threshold:
         return {
             "status": "Onderzoek nodig",
             "status_level": "orange",
-            "advice": "Controle of herhaalde meting aanbevolen. Het geluidsfragment wijkt mogelijk af van normaal gedrag."
+            "advice": "Controle of herhaalde meting aanbevolen. Eén of meerdere segmenten wijken mogelijk af."
         }
 
     return {
         "status": "Defect / niet normale situatie",
         "status_level": "red",
-        "advice": "Inspectie aanbevolen. Het geluidsfragment lijkt onvoldoende op normaal gedrag."
+        "advice": "Inspectie aanbevolen. Eén of meerdere segmenten passen onvoldoende bij het normale geluidsprofiel."
     }
 
 
+def score_segments_with_profile(
+    segment_feature_df: pd.DataFrame,
+    feature_columns: list,
+    profile_name: str,
+    profile_model_package: dict,
+    file_normality_percentile: float
+) -> dict:
+    """
+    Scoort één uploadbestand met één profielmodel.
+
+    Voorbeeld:
+    uploadbestand wordt gescoord met profielmodel id_04_6DB.
+    """
+
+    model = profile_model_package["model"]
+    calibration_scores = profile_model_package["calibration_scores"]
+    attention_threshold = int(profile_model_package["attention_threshold"])
+    defect_threshold = int(profile_model_package["defect_threshold"])
+
+    X_segments = segment_feature_df[feature_columns]
+    raw_scores = model.score_samples(X_segments)
+
+    segment_results = []
+
+    for index, raw_score in enumerate(raw_scores):
+        segment_row = segment_feature_df.iloc[index]
+
+        segment_normality = calculate_normality_score(
+            raw_score=float(raw_score),
+            calibration_scores=calibration_scores
+        )
+
+        segment_anomaly = 100 - segment_normality
+
+        if segment_normality >= attention_threshold:
+            segment_status = "normaal"
+        elif segment_normality >= defect_threshold:
+            segment_status = "onderzoek nodig"
+        else:
+            segment_status = "defect / niet normaal"
+
+        segment_results.append({
+            "segment_index": int(segment_row["segment_index"]),
+            "segment_start_seconds": float(segment_row["segment_start_seconds"]),
+            "segment_end_seconds": float(segment_row["segment_end_seconds"]),
+            "normality_score": round(segment_normality, 2),
+            "anomaly_score": round(segment_anomaly, 2),
+            "status": segment_status
+        })
+
+    segment_results_df = pd.DataFrame(segment_results)
+
+    file_normality_score = float(
+        np.percentile(
+            segment_results_df["normality_score"],
+            file_normality_percentile
+        )
+    )
+
+    file_anomaly_score = 100 - file_normality_score
+
+    worst_segment = segment_results_df.sort_values(
+        by="normality_score",
+        ascending=True
+    ).iloc[0]
+
+    status_info = determine_status(
+        normality_score=file_normality_score,
+        attention_threshold=attention_threshold,
+        defect_threshold=defect_threshold
+    )
+
+    return {
+        "profile_name": profile_name,
+        "asset_id": profile_model_package.get("asset_id"),
+        "noise_profile": profile_model_package.get("noise_profile"),
+        "normality_score": round(file_normality_score, 2),
+        "anomaly_score": round(file_anomaly_score, 2),
+        "attention_threshold": attention_threshold,
+        "defect_threshold": defect_threshold,
+        "status": status_info["status"],
+        "status_level": status_info["status_level"],
+        "advice": status_info["advice"],
+        "segment_results": segment_results,
+        "worst_segment_start": float(worst_segment["segment_start_seconds"]),
+        "worst_segment_end": float(worst_segment["segment_end_seconds"]),
+        "segments_total": int(len(segment_results_df))
+    }
+
+
+def aggregate_feature_summary(
+    segment_feature_df: pd.DataFrame,
+    feature_columns: list
+) -> dict:
+    """
+    Maakt een compacte feature-samenvatting voor weergave in de app.
+    """
+
+    summary = {}
+
+    for column in feature_columns:
+        if column in segment_feature_df.columns:
+            summary[f"{column}_mean_over_segments"] = float(segment_feature_df[column].mean())
+
+    return summary
+
+
 def create_explanation(
-    predicted_class: str,
+    selected_asset_id: str,
+    chosen_profile: str,
+    chosen_noise_profile: str,
+    normality_score: float,
     anomaly_score: float,
-    confidence_score: float,
-    status: str
+    status: str,
+    attention_threshold: int,
+    defect_threshold: int,
+    segments_total: int,
+    worst_segment_start: float,
+    worst_segment_end: float
 ) -> str:
     """
-    Maakt een korte zakelijke toelichting voor de demo-interface.
+    Maakt een uitleg voor de demo-interface.
     """
 
-    normal_score = 100 - anomaly_score
-
-    if predicted_class == "normaal":
-        return (
-            f"Het model herkent vooral kenmerken die passen bij normaal geluid. "
-            f"De normaliteits-score is {normal_score:.1f}/100. "
-            f"De risicoscore is {anomaly_score:.1f}/100. "
-            f"Status: {status}. "
-            f"De confidence score is {confidence_score:.2f}."
-        )
-
-    if predicted_class == "onderzoek nodig":
-        return (
-            f"Het model ziet lichte afwijkingen ten opzichte van normaal geluid. "
-            f"De normaliteits-score is {normal_score:.1f}/100. "
-            f"De risicoscore is {anomaly_score:.1f}/100. "
-            f"Status: {status}. "
-            f"Een controlemeting of inspectie is aanbevolen."
-        )
-
     return (
-        f"Het model herkent kenmerken die onvoldoende passen bij normaal geluid. "
-        f"De normaliteits-score is {normal_score:.1f}/100. "
+        f"Je hebt asset {selected_asset_id} geselecteerd. "
+        f"De applicatie heeft het uploadbestand automatisch vergeleken met de beschikbare ruisprofielen "
+        f"voor deze asset. Het best passende ruisprofiel is {chosen_noise_profile}. "
+        f"Daarom is referentiemodel {chosen_profile} gebruikt. "
+        f"Het bestand is opgeknipt in {segments_total} segment(en). "
+        f"Het meest afwijkende segment zat rond {worst_segment_start:.1f}-{worst_segment_end:.1f} seconden. "
+        f"Binnen dit referentieprofiel is het geluid {normality_score:.1f}% normaal. "
         f"De risicoscore is {anomaly_score:.1f}/100. "
-        f"Status: {status}. "
-        f"Inspectie is aanbevolen."
+        f"De aandachtgrens ligt op {attention_threshold}/100 en de defectgrens op {defect_threshold}/100. "
+        f"Conclusie: {status}."
     )
 
 
-def predict_audio_file(file_input, model_path: Path = MODEL_PATH) -> dict:
+def get_available_asset_ids(model_path: Path = MODEL_PATH) -> list:
     """
-    Voorspelt of een WAV-bestand normaal, onderzoek nodig of defect / niet normaal is.
+    Geeft de beschikbare asset-ID's terug uit het modelpakket.
+    """
 
-    Stappen:
-    1. model laden
-    2. features uit audio halen
-    3. featurekolommen in juiste volgorde zetten
-    4. kans op normaal en afwijkend berekenen
-    5. anomaly score berekenen
-    6. status en uitleg maken
+    model_package = load_model_package(model_path)
+    profile_models = model_package["profile_models"]
+
+    asset_ids = sorted({
+        profile_info.get("asset_id")
+        for profile_info in profile_models.values()
+        if profile_info.get("asset_id")
+    })
+
+    return asset_ids
+
+
+def predict_audio_file(
+    file_input,
+    selected_asset_id: str,
+    model_path: Path = MODEL_PATH
+) -> dict:
+    """
+    Voorspelt met profielspecifieke anomaly detection.
+
+    Werkwijze:
+    1. Gebruiker kiest asset-ID, bijvoorbeeld id_04.
+    2. De app scoort het uploadbestand met alle ruisprofielen van id_04.
+    3. De app kiest het profiel met de hoogste normaliteits-score.
+    4. Dat profiel bepaalt de eindconclusie.
     """
 
     model_package = load_model_package(model_path)
 
-    model = model_package["model"]
+    profile_models = model_package["profile_models"]
     feature_columns = model_package["feature_columns"]
     model_version = model_package["model_version"]
 
-    features = extract_features_from_file(file_input)
-    feature_df = pd.DataFrame([features])
+    segment_duration_seconds = float(model_package.get("segment_duration_seconds", 3.0))
+    hop_duration_seconds = float(model_package.get("hop_duration_seconds", 1.5))
+    file_normality_percentile = float(model_package.get("file_normality_percentile", 35))
+
+    matching_profiles = {
+        profile_name: profile_info
+        for profile_name, profile_info in profile_models.items()
+        if profile_info.get("asset_id") == selected_asset_id
+    }
+
+    if not matching_profiles:
+        available_assets = sorted({
+            profile_info.get("asset_id")
+            for profile_info in profile_models.values()
+            if profile_info.get("asset_id")
+        })
+
+        raise ValueError(
+            f"Er zijn geen profielmodellen gevonden voor asset {selected_asset_id}. "
+            f"Beschikbare assets: {available_assets}"
+        )
+
+    segment_feature_df = extract_segment_features_from_file(
+        file_input=file_input,
+        segment_duration_seconds=segment_duration_seconds,
+        hop_duration_seconds=hop_duration_seconds
+    )
 
     missing_columns = [
         column for column in feature_columns
-        if column not in feature_df.columns
+        if column not in segment_feature_df.columns
     ]
 
     if missing_columns:
         raise ValueError(
-            "Niet alle model-features konden uit het audiobestand worden gehaald. "
+            "Niet alle model-features konden uit de audiosegmenten worden gehaald. "
             f"Ontbrekende kolommen: {missing_columns}"
         )
 
-    X = feature_df[feature_columns]
+    profile_scores = []
 
-    if hasattr(model, "predict_proba"):
-        probabilities = model.predict_proba(X)[0]
+    for profile_name, profile_info in matching_profiles.items():
+        profile_score = score_segments_with_profile(
+            segment_feature_df=segment_feature_df,
+            feature_columns=feature_columns,
+            profile_name=profile_name,
+            profile_model_package=profile_info,
+            file_normality_percentile=file_normality_percentile
+        )
 
-        # Labelafspraak:
-        # 0 = normaal
-        # 1 = afwijkend
-        probability_normal = float(probabilities[0])
-        probability_abnormal = float(probabilities[1])
-    else:
-        raw_prediction = int(model.predict(X)[0])
-        probability_abnormal = float(raw_prediction)
-        probability_normal = 1.0 - probability_abnormal
+        profile_scores.append(profile_score)
 
-    anomaly_score = probability_abnormal * 100
-    normal_score = probability_normal * 100
+    profile_scores_df = pd.DataFrame(profile_scores)
 
-    # ------------------------------------------------------------
-    # Nieuwe beoordelingsgrenzen
-    # ------------------------------------------------------------
-    # 0 t/m 5% afwijkend = normaal
-    # >5 t/m 20% afwijkend = onderzoek nodig
-    # >20% afwijkend = defect / niet normaal
-    # ------------------------------------------------------------
+    best_profile_row = profile_scores_df.sort_values(
+        by="normality_score",
+        ascending=False
+    ).iloc[0]
 
-    if anomaly_score <= 5:
+    chosen_profile_name = best_profile_row["profile_name"]
+    chosen_profile_score = next(
+        item for item in profile_scores
+        if item["profile_name"] == chosen_profile_name
+    )
+
+    normality_score = float(chosen_profile_score["normality_score"])
+    anomaly_score = float(chosen_profile_score["anomaly_score"])
+
+    if chosen_profile_score["status_level"] == "green":
         predicted_label = 0
         predicted_class = "normaal"
-        confidence_score = probability_normal
-
-    elif anomaly_score <= 20:
+    elif chosen_profile_score["status_level"] == "orange":
         predicted_label = 2
         predicted_class = "onderzoek nodig"
-        confidence_score = max(probability_normal, probability_abnormal)
-
     else:
         predicted_label = 1
         predicted_class = "defect / niet normaal"
-        confidence_score = probability_abnormal
 
-    status_info = determine_status(anomaly_score)
+    probability_normal = normality_score / 100
+    probability_abnormal = anomaly_score / 100
+    confidence_score = max(probability_normal, probability_abnormal)
 
     explanation = create_explanation(
-        predicted_class=predicted_class,
+        selected_asset_id=selected_asset_id,
+        chosen_profile=chosen_profile_name,
+        chosen_noise_profile=chosen_profile_score["noise_profile"],
+        normality_score=normality_score,
         anomaly_score=anomaly_score,
-        confidence_score=confidence_score,
-        status=status_info["status"]
+        status=chosen_profile_score["status"],
+        attention_threshold=int(chosen_profile_score["attention_threshold"]),
+        defect_threshold=int(chosen_profile_score["defect_threshold"]),
+        segments_total=int(chosen_profile_score["segments_total"]),
+        worst_segment_start=float(chosen_profile_score["worst_segment_start"]),
+        worst_segment_end=float(chosen_profile_score["worst_segment_end"])
+    )
+
+    feature_summary = aggregate_feature_summary(
+        segment_feature_df=segment_feature_df,
+        feature_columns=feature_columns
     )
 
     return {
@@ -206,13 +373,21 @@ def predict_audio_file(file_input, model_path: Path = MODEL_PATH) -> dict:
         "probability_normal": probability_normal,
         "probability_abnormal": probability_abnormal,
         "confidence_score": confidence_score,
-        "normal_score": round(normal_score, 2),
+        "normal_score": round(normality_score, 2),
+        "normality_score": round(normality_score, 2),
         "anomaly_score": round(anomaly_score, 2),
-        "status": status_info["status"],
-        "status_level": status_info["status_level"],
-        "advice": status_info["advice"],
+        "status": chosen_profile_score["status"],
+        "status_level": chosen_profile_score["status_level"],
+        "advice": chosen_profile_score["advice"],
         "explanation": explanation,
         "model_version": model_version,
-        "features": features,
-        "abnormal_threshold": ABNORMAL_THRESHOLD
+        "features": feature_summary,
+        "segment_results": chosen_profile_score["segment_results"],
+        "profile_scores": profile_scores,
+        "selected_asset_id": selected_asset_id,
+        "chosen_profile": chosen_profile_name,
+        "chosen_noise_profile": chosen_profile_score["noise_profile"],
+        "attention_threshold": int(chosen_profile_score["attention_threshold"]),
+        "defect_threshold": int(chosen_profile_score["defect_threshold"]),
+        "model_type": "profile_specific_segment_anomaly_detection"
     }

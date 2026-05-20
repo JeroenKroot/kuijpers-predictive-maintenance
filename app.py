@@ -19,6 +19,7 @@ from src.preprocessing import (
 
 from src.feature_extraction import (
     create_feature_dataset,
+    create_segment_feature_dataset,
     get_model_feature_columns
 )
 
@@ -28,7 +29,10 @@ from src.train_model import (
     MODEL_VERSION
 )
 
-from src.predict import predict_audio_file
+from src.predict import (
+    predict_audio_file,
+    get_available_asset_ids
+)
 
 from src.visualization import (
     create_waveform_figure,
@@ -39,14 +43,9 @@ from src.history_logger import (
     log_analysis_result,
     load_analysis_history,
     clear_analysis_history,
-    anonymize_filename,
-    HISTORY_PATH
+    anonymize_filename
 )
 
-
-# ------------------------------------------------------------
-# Pagina-instellingen
-# ------------------------------------------------------------
 
 st.set_page_config(
     page_title="Kuijpers Predictive Maintenance",
@@ -54,10 +53,6 @@ st.set_page_config(
     layout="wide"
 )
 
-
-# ------------------------------------------------------------
-# Styling
-# ------------------------------------------------------------
 
 st.markdown(
     """
@@ -146,15 +141,7 @@ st.markdown(
 )
 
 
-# ------------------------------------------------------------
-# Helperfuncties
-# ------------------------------------------------------------
-
 def get_status_visuals(status_level: str) -> dict:
-    """
-    Koppelt statusniveau aan kleur, label en icoon.
-    """
-
     if status_level == "green":
         return {
             "color": "#2EAD4B",
@@ -177,10 +164,6 @@ def get_status_visuals(status_level: str) -> dict:
 
 
 def load_training_data_safely():
-    """
-    Laadt trainingsdata zonder de app te laten crashen.
-    """
-
     try:
         training_index = create_training_index(
             normal_folder="data/normaal",
@@ -196,9 +179,30 @@ def load_training_data_safely():
         return pd.DataFrame(), None, pd.DataFrame(), error
 
 
-# ------------------------------------------------------------
-# Header
-# ------------------------------------------------------------
+def safe_metric_value(metrics: dict, key: str, default="n.v.t."):
+    value = metrics.get(key, default)
+
+    if value is None:
+        return default
+
+    return value
+
+
+def get_asset_ids_from_data(training_index: pd.DataFrame) -> list:
+    asset_ids = []
+
+    if training_index.empty:
+        return asset_ids
+
+    for source_folder in training_index["source_folder"].dropna().unique():
+        parts = source_folder.split("_")
+
+        if len(parts) >= 2:
+            asset_id = "_".join(parts[:2])
+            asset_ids.append(asset_id)
+
+    return sorted(list(set(asset_ids)))
+
 
 logo_path = Path("assets/kuijpers_logo.png")
 
@@ -224,10 +228,6 @@ with header_col_text:
     )
 
 
-# ------------------------------------------------------------
-# Sidebar
-# ------------------------------------------------------------
-
 st.sidebar.title("Demo-instellingen")
 
 st.sidebar.markdown("### POC scope")
@@ -240,7 +240,7 @@ st.sidebar.write(f"Maximale lengte: `{MAX_DURATION_SECONDS} sec.`")
 
 st.sidebar.markdown("### Model")
 st.sidebar.write(f"Modelversie: `{MODEL_VERSION}`")
-st.sidebar.write("Modeltype: `Random Forest`")
+st.sidebar.write("Modeltype: `Profielspecifieke segment-anomaly detection`")
 
 if MODEL_PATH.exists():
     st.sidebar.success("Model beschikbaar")
@@ -249,30 +249,22 @@ else:
 
 st.sidebar.markdown("---")
 st.sidebar.caption(
-    "Deze demo gebruikt geanonimiseerde bestandsnamen en toont geen klantnamen, assetnamen of locaties."
+    "De gebruiker kiest alleen het asset-ID. De app bepaalt automatisch welk ruisprofiel het beste past."
 )
 
-
-# ------------------------------------------------------------
-# Intro
-# ------------------------------------------------------------
 
 st.markdown(
     """
     <div class="demo-card">
         <b>Doel van deze demo:</b><br>
-        Upload een WAV-bestand van een technische installatie. De applicatie analyseert het geluid,
-        vergelijkt dit met gelabelde trainingsdata en geeft een indicatie of het geluid normaal is,
-        onderzoek nodig heeft of mogelijk wijst op een defect / niet normale situatie.
+        Kies een asset-ID en upload een WAV-bestand. De applicatie bepaalt automatisch welk ruisprofiel
+        binnen deze asset het beste past, gebruikt het bijbehorende anomaly detection model en geeft een conclusie:
+        normale situatie, onderzoek nodig of defect / niet normale situatie.
     </div>
     """,
     unsafe_allow_html=True
 )
 
-
-# ------------------------------------------------------------
-# Tabs
-# ------------------------------------------------------------
 
 tab_demo, tab_training, tab_data, tab_info = st.tabs(
     [
@@ -284,12 +276,25 @@ tab_demo, tab_training, tab_data, tab_info = st.tabs(
 )
 
 
-# ------------------------------------------------------------
-# TAB 1 — Demo-analyse
-# ------------------------------------------------------------
-
 with tab_demo:
     st.markdown("## Demo-analyse van nieuw geluidsfragment")
+
+    training_index_for_assets, _, _, _ = load_training_data_safely()
+
+    asset_options = []
+
+    if MODEL_PATH.exists():
+        try:
+            asset_options = get_available_asset_ids()
+        except Exception:
+            asset_options = get_asset_ids_from_data(training_index_for_assets)
+    else:
+        asset_options = get_asset_ids_from_data(training_index_for_assets)
+
+    if not asset_options:
+        st.warning(
+            "Er zijn nog geen asset-ID's gevonden. Controleer de data of train eerst het model."
+        )
 
     left_col, right_col = st.columns([1.05, 1])
 
@@ -297,9 +302,24 @@ with tab_demo:
         st.markdown(
             """
             <div class="upload-box">
-                <b>Upload geluidsfragment</b><br>
-                Upload een WAV-bestand. De originele bestandsnaam wordt niet getoond in de analysehistorie
-                of demo-uitkomst.
+                <b>Stap 1 — Kies asset-ID</b><br>
+                Kies alleen het asset-ID. De app bepaalt daarna zelf welk ruisprofiel het beste past.
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        selected_asset_id = st.selectbox(
+            "Asset-ID",
+            options=asset_options,
+            index=0 if asset_options else None
+        )
+
+        st.markdown(
+            """
+            <div class="upload-box">
+                <b>Stap 2 — Upload geluidsfragment</b><br>
+                Upload een WAV-bestand. De originele bestandsnaam wordt niet opgeslagen.
             </div>
             """,
             unsafe_allow_html=True
@@ -324,26 +344,25 @@ with tab_demo:
         st.markdown(
             """
             <div class="section-card">
-                <h3 style="margin-top: 0;">Beoordelingslogica</h3>
+                <h3 style="margin-top: 0;">Automatische ruisprofielkeuze</h3>
                 <p>
-                    De app rekent de modeluitkomst om naar een risicoscore.
-                    Voor deze demo gelden de volgende grenzen:
+                    De app vergelijkt het uploadbestand alleen met de modellen van het gekozen asset-ID.
+                    Bijvoorbeeld bij <b>id_04</b> vergelijkt de app met:
                 </p>
                 <ul>
-                    <li><b>0 t/m 5%</b> afwijkend: normale situatie</li>
-                    <li><b>&gt;5 t/m 20%</b> afwijkend: onderzoek nodig</li>
-                    <li><b>&gt;20%</b> afwijkend: defect / niet normale situatie</li>
+                    <li>id_04_0DB</li>
+                    <li>id_04_6DB</li>
+                    <li>id_04_m6DB</li>
                 </ul>
                 <p class="small-muted">
-                    De grenzen zijn bewust gevoelig ingesteld, omdat bij predictive maintenance
-                    vroegtijdig signaleren belangrijker is dan wachten tot een afwijking extreem duidelijk is.
+                    Het profiel met de hoogste normaliteits-score wordt gebruikt voor de eindconclusie.
                 </p>
             </div>
             """,
             unsafe_allow_html=True
         )
 
-    if uploaded_file is not None:
+    if uploaded_file is not None and selected_asset_id:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
             temp_audio.write(uploaded_file.read())
             temp_audio_path = temp_audio.name
@@ -363,14 +382,15 @@ with tab_demo:
                 st.warning("Er is nog geen model gevonden. Train eerst het model via de tab Modeltraining.")
 
             else:
-                prediction = predict_audio_file(temp_audio_path)
+                prediction = predict_audio_file(
+                    file_input=temp_audio_path,
+                    selected_asset_id=selected_asset_id
+                )
 
-                # Analyse opslaan in CSV-historie.
-                # Let op: originele bestandsnaam wordt niet opgeslagen.
                 log_analysis_result(
                     prediction=prediction,
                     filename_anonymized=anonymized_filename,
-                    asset_id="Asset 001",
+                    asset_id=selected_asset_id,
                     location="Locatie A"
                 )
 
@@ -388,6 +408,15 @@ with tab_demo:
                         <div class="status-card" style="border-left: 12px solid {status_visuals["color"]};">
                             <div class="status-title">
                                 {status_visuals["icon"]} {prediction["status"]}
+                            </div>
+                            <div class="status-subtitle">
+                                <b>Gekozen asset:</b> {prediction["selected_asset_id"]}
+                            </div>
+                            <div class="status-subtitle">
+                                <b>Automatisch bepaald ruisprofiel:</b> {prediction["chosen_noise_profile"]}
+                            </div>
+                            <div class="status-subtitle">
+                                <b>Gebruikt referentiemodel:</b> {prediction["chosen_profile"]}
                             </div>
                             <div class="status-subtitle">
                                 <b>Classificatie:</b> {prediction["predicted_class"]}
@@ -436,6 +465,11 @@ with tab_demo:
 
                     st.metric("Confidence score", f"{confidence_score:.2f}")
 
+                    st.markdown("---")
+                    st.write("Gebruikte grenzen:")
+                    st.write(f"Aandachtgrens: `{prediction['attention_threshold']}/100`")
+                    st.write(f"Defectgrens: `{prediction['defect_threshold']}/100`")
+
                     st.markdown("</div>", unsafe_allow_html=True)
 
                 st.markdown("## Audiovisualisatie")
@@ -462,7 +496,52 @@ with tab_demo:
                     st.metric("Duur na preprocessing", f"{preprocessing_result['duration_seconds']} sec.")
                     st.metric("Modelversie", prediction["model_version"])
 
+                    if "segment_results" in prediction:
+                        st.metric("Aantal segmenten", len(prediction["segment_results"]))
+
                     st.markdown("</div>", unsafe_allow_html=True)
+
+                with st.expander("Waarom is dit ruisprofiel gekozen?"):
+                    profile_scores_df = pd.DataFrame(prediction["profile_scores"])
+                    columns_to_show = [
+                        "profile_name",
+                        "asset_id",
+                        "noise_profile",
+                        "normality_score",
+                        "anomaly_score",
+                        "status",
+                        "attention_threshold",
+                        "defect_threshold"
+                    ]
+
+                    available_columns = [
+                        column for column in columns_to_show
+                        if column in profile_scores_df.columns
+                    ]
+
+                    st.dataframe(
+                        profile_scores_df[available_columns].sort_values(
+                            by="normality_score",
+                            ascending=False
+                        ),
+                        use_container_width=True
+                    )
+
+                    st.write(
+                        "Het profiel met de hoogste normaliteits-score wordt gekozen als best passende referentie."
+                    )
+
+                with st.expander("Segmentanalyse bekijken"):
+                    if "segment_results" in prediction:
+                        segment_df = pd.DataFrame(prediction["segment_results"])
+                        st.dataframe(segment_df, use_container_width=True)
+
+                        st.write(
+                            "Hier zie je per segment de normaliteits-score, risicoscore en status. "
+                            "Zo kun je zien op welk moment in het geluidsfragment de grootste afwijking zit."
+                        )
+                    else:
+                        st.info("Geen segmentanalyse beschikbaar.")
 
                 with st.expander("Berekende audiofeatures bekijken"):
                     feature_df = pd.DataFrame([prediction["features"]])
@@ -514,65 +593,67 @@ with tab_demo:
                 st.success("Analysehistorie is leeggemaakt. Vernieuw de pagina om de lege tabel te zien.")
 
 
-# ------------------------------------------------------------
-# TAB 2 — Modeltraining
-# ------------------------------------------------------------
-
 with tab_training:
-    st.markdown("## Supervised model trainen")
+    st.markdown("## Profielspecifieke anomaly detection modellen trainen")
 
     st.write(
-        "Train het Random Forest-model opnieuw op basis van de gelabelde bestanden "
-        "in `data/normaal` en `data/afwijkend`."
+        "De app traint per combinatie van asset-ID en ruisprofiel een apart anomaly detection model. "
+        "Bijvoorbeeld: id_04_0DB, id_04_6DB en id_04_m6DB."
     )
 
     st.markdown(
         """
         <div class="demo-card">
-            <b>Let op:</b> opnieuw trainen is alleen nodig als je nieuwe trainingsbestanden toevoegt
-            of features/modelinstellingen hebt aangepast.
+            <b>Belangrijk:</b> het model leert alleen van normale geluidsbestanden.
+            Afwijkende bestanden worden alleen gebruikt om de thresholds en evaluatie te bepalen.
         </div>
         """,
         unsafe_allow_html=True
     )
 
-    if st.button("Train Random Forest-model", type="primary"):
-        with st.spinner("Model wordt getraind. Features worden opnieuw berekend..."):
+    if st.button("Train profielspecifieke anomaly detection modellen", type="primary"):
+        with st.spinner("Profielmodellen worden getraind. Dit kan even duren..."):
             try:
                 training_result = train_and_save_model()
 
                 metrics = training_result["metrics"]
-                confusion_matrix_df = training_result["confusion_matrix"]
+                profile_metrics_df = training_result["profile_metrics_df"]
                 feature_df = training_result["feature_df"]
 
-                st.success(f"Model succesvol getraind en opgeslagen als `{training_result['model_path']}`.")
+                st.success(f"Modellen succesvol getraind en opgeslagen als `{training_result['model_path']}`.")
 
                 col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Accuracy", metrics["accuracy"])
-                col2.metric("Precision", metrics["precision"])
-                col3.metric("Recall", metrics["recall"])
-                col4.metric("F1-score", metrics["f1_score"])
+                col1.metric("Gem. accuracy", safe_metric_value(metrics, "accuracy"))
+                col2.metric("Gem. precision", safe_metric_value(metrics, "precision"))
+                col3.metric("Gem. recall", safe_metric_value(metrics, "recall"))
+                col4.metric("Gem. F1-score", safe_metric_value(metrics, "f1_score"))
 
                 col5, col6, col7, col8 = st.columns(4)
-                col5.metric("ROC-AUC", metrics["roc_auc"] if metrics["roc_auc"] is not None else "n.v.t.")
-                col6.metric("Train samples", metrics["train_samples"])
-                col7.metric("Test samples", metrics["test_samples"])
-                col8.metric("Feature-kolommen", len(training_result["feature_columns"]))
+                col5.metric("Gem. ROC-AUC", safe_metric_value(metrics, "roc_auc"))
+                col6.metric("Profielen getraind", safe_metric_value(metrics, "profiles_trained"))
+                col7.metric("Normale bestanden", safe_metric_value(metrics, "normal_samples"))
+                col8.metric("Afwijkende bestanden", safe_metric_value(metrics, "abnormal_samples"))
 
-                st.subheader("Verdeling trainingsdata")
-                data_distribution = pd.DataFrame([
-                    {"klasse": "normaal", "aantal": metrics["normal_samples"]},
-                    {"klasse": "afwijkend", "aantal": metrics["abnormal_samples"]}
-                ])
-                st.dataframe(data_distribution, use_container_width=True)
+                st.subheader("Metrics per profiel")
 
-                st.subheader("Confusion matrix")
-                st.dataframe(confusion_matrix_df, use_container_width=True)
+                st.dataframe(
+                    profile_metrics_df,
+                    use_container_width=True
+                )
 
-                with st.expander("Voorbeeld van gebruikte feature-dataset"):
+                if training_result["skipped_profiles"]:
+                    st.warning(
+                        "Deze profielen zijn overgeslagen omdat er te weinig normale bestanden waren:"
+                    )
+                    st.write(training_result["skipped_profiles"])
+
+                with st.expander("Voorbeeld van gebruikte segment-feature-dataset"):
                     columns_to_show = [
                         "class_name",
                         "source_folder",
+                        "segment_index",
+                        "segment_start_seconds",
+                        "segment_end_seconds",
                         "duration_seconds",
                         "rms_energy_mean",
                         "spectral_centroid_mean",
@@ -587,7 +668,7 @@ with tab_training:
                     ]
 
                     st.dataframe(
-                        feature_df[available_columns_to_show].head(30),
+                        feature_df[available_columns_to_show].head(50),
                         use_container_width=True
                     )
 
@@ -602,10 +683,6 @@ with tab_training:
     else:
         st.warning("Er is nog geen opgeslagen model gevonden.")
 
-
-# ------------------------------------------------------------
-# TAB 3 — Data controle
-# ------------------------------------------------------------
 
 with tab_data:
     st.markdown("## Data controle")
@@ -667,7 +744,7 @@ with tab_data:
         st.markdown("---")
         st.subheader("Feature extraction controleren")
 
-        if st.button("Maak features van trainingsbestanden"):
+        if st.button("Maak features van volledige trainingsbestanden"):
             with st.spinner("Features worden gemaakt..."):
                 feature_df = create_feature_dataset(training_index)
 
@@ -686,36 +763,38 @@ with tab_data:
                 st.warning("Voor sommige bestanden konden geen features worden gemaakt.")
                 st.dataframe(invalid_feature_df, use_container_width=True)
 
-            columns_to_show = [
-                "class_name",
-                "source_folder",
-                "duration_seconds",
-                "rms_energy_mean",
-                "spectral_centroid_mean",
-                "spectral_rolloff_mean",
-                "zero_crossing_rate_mean",
-                "band_energy_0_500",
-                "band_energy_500_2000",
-                "band_energy_2000_5000",
-                "band_energy_5000_8000",
-                "label"
-            ]
+            st.dataframe(valid_feature_df.head(30), use_container_width=True)
 
-            available_columns_to_show = [
-                column for column in columns_to_show
-                if column in valid_feature_df.columns
-            ]
+        st.markdown("---")
+        st.subheader("Segment feature extraction controleren")
 
-            st.subheader("Voorbeeld feature-dataset")
-            st.dataframe(
-                valid_feature_df[available_columns_to_show].head(30),
-                use_container_width=True
-            )
+        if st.button("Maak segment-features van trainingsbestanden"):
+            with st.spinner("Audio wordt opgeknipt in segmenten en features worden gemaakt..."):
+                segment_feature_df = create_segment_feature_dataset(training_index)
 
+            valid_segment_df = segment_feature_df[
+                segment_feature_df["is_valid"] == True
+            ].copy()
 
-# ------------------------------------------------------------
-# TAB 4 — POC toelichting
-# ------------------------------------------------------------
+            invalid_segment_df = segment_feature_df[
+                segment_feature_df["is_valid"] == False
+            ].copy()
+
+            segment_feature_columns = get_model_feature_columns(valid_segment_df)
+
+            col_a, col_b, col_c = st.columns(3)
+            col_a.metric("Totaal segmentregels", len(segment_feature_df))
+            col_b.metric("Segmenten gelukt", len(valid_segment_df))
+            col_c.metric("Aantal feature-kolommen", len(segment_feature_columns))
+
+            if len(invalid_segment_df) == 0:
+                st.success("Voor alle segmenten zijn features gemaakt.")
+            else:
+                st.warning("Voor sommige bestanden konden geen segmentfeatures worden gemaakt.")
+                st.dataframe(invalid_segment_df, use_container_width=True)
+
+            st.dataframe(valid_segment_df.head(50), use_container_width=True)
+
 
 with tab_info:
     st.markdown("## POC toelichting")
@@ -725,38 +804,31 @@ with tab_info:
         ### Wat doet deze demo?
 
         Deze applicatie analyseert losse WAV-bestanden van technische installaties.
-        Het model is vooraf getraind met gelabelde voorbeelden van normale en afwijkende geluiden.
+        De gebruiker kiest alleen het asset-ID. De applicatie bepaalt daarna automatisch welk ruisprofiel
+        het beste past bij het uploadbestand.
 
-        De demo voert deze stappen uit:
+        ### Werkwijze
 
-        1. WAV-bestand uploaden;
-        2. audio preprocessing;
-        3. feature extraction;
-        4. voorspelling met supervised machine learning;
-        5. vertaling naar normaliteits-score, risicoscore en advies;
-        6. opslag van de analyse in een geanonimiseerde CSV-historie.
+        1. De gebruiker kiest een asset-ID, bijvoorbeeld `id_04`.
+        2. De gebruiker uploadt een WAV-bestand.
+        3. De app knipt de audio op in segmenten.
+        4. De app vergelijkt het bestand met de profielmodellen van de gekozen asset:
+           - `id_04_0DB`
+           - `id_04_6DB`
+           - `id_04_m6DB`
+        5. Het profiel met de hoogste normaliteits-score wordt automatisch gekozen.
+        6. De app geeft een conclusie:
+           - normale situatie;
+           - onderzoek nodig;
+           - defect / niet normale situatie.
 
-        ### Wat betekent de score?
+        ### Waarom deze aanpak?
 
-        De risicoscore is gebaseerd op de kans dat het geluidsfragment afwijkt van normaal gedrag.
+        Eén algemeen model moet alle assets en alle ruisniveaus tegelijk begrijpen.
+        Daardoor wordt het normale profiel breed en ontstaan sneller valse meldingen.
 
-        - **0 t/m 5% afwijkend:** normale situatie;
-        - **>5 t/m 20% afwijkend:** onderzoek nodig;
-        - **>20% afwijkend:** defect / niet normale situatie.
-
-        ### Analysehistorie
-
-        Iedere succesvolle analyse wordt opgeslagen in:
-
-        `history/analyse_history.csv`
-
-        Daarbij worden alleen generieke waarden opgeslagen, zoals:
-
-        - Asset 001;
-        - Locatie A;
-        - meting_YYYYMMDD_HHMMSS.wav.
-
-        De originele bestandsnaam wordt niet opgeslagen.
+        Met profielspecifieke modellen vergelijkt de app het uploadbestand alleen met relevante
+        normale referenties. Dat maakt de beoordeling specifieker en beter uitlegbaar.
 
         ### Wat zit bewust nog niet in fase A?
 
@@ -767,13 +839,12 @@ with tab_info:
         - automatische werkorderkoppeling;
         - exacte defectclassificatie;
         - self-learning model in productie;
-        - klant- of assetherkenning.
+        - klant- of assetherkenning buiten de gekozen asset-ID.
 
-        ### Waarom deze aanpak?
+        ### Interpretatie
 
-        Deze fase toont eerst aan dat geluidsfragmenten technisch kunnen worden verwerkt en dat een supervised model
-        verschil kan leren tussen normale en afwijkende geluiden.
-
-        Daarmee vormt fase A een laagdrempelige opstap naar fase B en C.
+        Deze POC toont aan dat geluidsanalyse technisch mogelijk is en dat de app automatisch
+        een passend ruisprofiel kan kiezen binnen een gekozen asset. De uitkomsten zijn geschikt
+        voor demonstratie en verdere validatie, maar nog niet bedoeld als zelfstandig onderhoudsbesluit.
         """
     )
